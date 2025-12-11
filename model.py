@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from utils import LinearLayer, MLP, _get_clones
+# 引入修正后的 Cross-Attention 模块
 from mesm_layers import T2V_TransformerEncoderLayer, T2V_TransformerEncoder
 from bam_layers import (
     TransformerDecoder, 
@@ -12,6 +13,7 @@ from bam_layers import (
 class MultiContextPerception(nn.Module):
     def __init__(self, hidden_dim, nhead=8, dropout=0.1):
         super().__init__()
+        # W2W 保持不变
         self.ec_attn = nn.MultiheadAttention(hidden_dim, nhead, dropout=dropout)
         self.ec_norm = nn.LayerNorm(hidden_dim)
         self.cc_conv = nn.Sequential(
@@ -24,11 +26,9 @@ class MultiContextPerception(nn.Module):
         self.fusion_norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x, key_padding_mask=None):
-        # Event Context
         ec_feat, _ = self.ec_attn(x, x, x, key_padding_mask=key_padding_mask)
         x_ec = self.ec_norm(x + ec_feat)
         
-        # Chronological Context
         x_perm = x.permute(1, 2, 0)
         if key_padding_mask is not None:
             mask = key_padding_mask.unsqueeze(1).float()
@@ -44,7 +44,7 @@ class MESM_W2W_BAM(nn.Module):
         self.args = args
         self.hidden_dim = args.hidden_dim
         
-        # 1. Encoders
+        # Encoders
         self.text_encoder = text_encoder
         self.input_txt_proj = LinearLayer(args.t_feat_dim, args.hidden_dim)
         self.input_vid_proj = LinearLayer(args.v_feat_dim, args.hidden_dim)
@@ -52,7 +52,7 @@ class MESM_W2W_BAM(nn.Module):
         self.vid_pos_embed, _ = build_position_encoding(args)
         self.txt_pos_embed = nn.Embedding(args.max_q_l, args.hidden_dim)
 
-        # 2. MESM Layers
+        # MESM Layers (Cross Attention)
         enhance_layer = T2V_TransformerEncoderLayer(args.hidden_dim, args.nheads)
         self.enhance_encoder = T2V_TransformerEncoder(enhance_layer, num_layers=2)
         
@@ -60,57 +60,66 @@ class MESM_W2W_BAM(nn.Module):
         self.t2v_encoder = T2V_TransformerEncoder(align_layer, num_layers=3)
         
         if hasattr(args, 'rec_fw') and args.rec_fw:
-            self.output_txt_proj = nn.Linear(args.hidden_dim, 49408) # Vocab size
+            self.output_txt_proj = nn.Linear(args.hidden_dim, 49408)
 
-        # 3. W2W Module
+        # W2W & BAM Decoder
         self.w2w_context = MultiContextPerception(args.hidden_dim, args.nheads)
 
-        # 4. BAM Decoder
         bam_layer = TransformerDecoderLayer(args.hidden_dim, args.nheads)
         boundary_layer = BoundaryDecoderLayer(args.hidden_dim, nhead=args.nheads)
         self.transformer_decoder = TransformerDecoder(
             bam_layer, boundary_layer, args.dec_layers, args.hidden_dim, args.nheads, return_intermediate=True
         )
         
-        # 5. Heads
-        self.query_embed = nn.Embedding(args.num_queries, 2) # Center, Width
+        self.query_embed = nn.Embedding(args.num_queries, 2)
         self.class_embed = nn.Linear(args.hidden_dim, 2)
         self.span_embed = MLP(args.hidden_dim, args.hidden_dim, 2, 3)
         
-        # Init Heads
         self.class_embed = _get_clones(self.class_embed, args.dec_layers)
         self.span_embed = _get_clones(self.span_embed, args.dec_layers)
         self.transformer_decoder.bbox_embed = self.span_embed
 
     def forward(self, video_feat, video_mask, words_id, words_mask, is_training=False):
-        # Feature Projection
+        # 1. 文本编码兼容处理
         if self.text_encoder:
-            words_feat = self.text_encoder(words_id)['last_hidden_state']
+            txt_out = self.text_encoder(words_id)
+            if isinstance(txt_out, dict):
+                words_feat = txt_out['last_hidden_state']
+            else:
+                words_feat = txt_out # GloVe 直接返回 tensor
         else:
-            words_feat = words_id # Debug mode
+            words_feat = words_id
             
-        src_txt = self.input_txt_proj(words_feat).permute(1, 0, 2)
-        src_vid = self.input_vid_proj(video_feat).permute(1, 0, 2)
+        src_txt = self.input_txt_proj(words_feat).permute(1, 0, 2) # [L_t, B, D]
+        src_vid = self.input_vid_proj(video_feat).permute(1, 0, 2) # [L_v, B, D]
         
-        # Positional Embedding
-        pos_v = self.vid_pos_embed(src_vid.permute(1, 0, 2), video_mask).permute(2, 0, 1) # [L, B, D]
+        # Positional Embeddings
+        pos_v = self.vid_pos_embed(src_vid.permute(1, 0, 2), video_mask).permute(2, 0, 1)
         pos_t = self.txt_pos_embed.weight[:src_txt.shape[0]].unsqueeze(1).repeat(1, src_txt.shape[1], 1)
 
-        # MESM Enhance
-        enhanced_vid = self.enhance_encoder(src_txt, src_vid, 
-                                            src_key_padding_mask=~words_mask, pos=pos_t) # 简化参数调用
+        # 2. MESM Enhance (FW-Level): Video query, Text key
+        # 目的是利用文本增强视频，所以 Query 是 Video
+        enhanced_vid = self.enhance_encoder(
+            query=src_vid, key=src_txt, 
+            key_padding_mask=~words_mask, 
+            pos_q=pos_v, pos_k=pos_t
+        )
         
-        # MESM Align
-        f_aligned = self.t2v_encoder(src_txt, enhanced_vid, 
-                                     src_key_padding_mask=~words_mask, pos=pos_t)
+        # 3. MESM Align (T2V): Video query, Text key
+        # 对齐后的特征依旧保持 Video 的长度，用于后续 W2W
+        f_aligned = self.t2v_encoder(
+            query=enhanced_vid, key=src_txt, 
+            key_padding_mask=~words_mask, 
+            pos_q=pos_v, pos_k=pos_t
+        )
 
-        # W2W Context
+        # 4. W2W Context (Requires Video Length)
         f_context = self.w2w_context(f_aligned, key_padding_mask=~video_mask)
 
-        # BAM Decoder
+        # 5. BAM Decoder
         bs = video_feat.shape[0]
-        query_pos = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1) # [Nq, B, 2]
-        tgt = torch.zeros_like(query_pos).repeat(1, 1, self.hidden_dim // 2) # Dummy content
+        query_pos = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+        tgt = torch.zeros_like(query_pos).repeat(1, 1, self.hidden_dim // 2)
 
         hs, refs, _ = self.transformer_decoder(
             tgt, f_context, memory_key_padding_mask=~video_mask, 
