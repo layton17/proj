@@ -3,14 +3,15 @@ import torch.nn as nn
 import numpy as np
 from collections import OrderedDict
 from tqdm import tqdm
+import logging
+
+logger = logging.getLogger(__name__)
 
 # =================================================================
-# 1. 基础组件 (LayerNorm, QuickGELU, ResidualAttentionBlock)
-#    用于构建 CLIP 的 Transformer 结构
+# 1. 基础组件
 # =================================================================
 
 class LayerNorm(nn.LayerNorm):
-    """Subclass torch's LayerNorm to handle fp16."""
     def forward(self, x: torch.Tensor):
         orig_type = x.dtype
         ret = super().forward(x.type(torch.float32))
@@ -54,100 +55,54 @@ class Transformer(nn.Module):
 
 # =================================================================
 # 2. CLIP Text Encoder
-#    手动实现的 CLIP 文本编码器，加载权重后可提取 Token 级特征
 # =================================================================
 
 class CLIPTextEncoder(nn.Module):
-    def __init__(self,
-                 embed_dim: int = 512,
-                 context_length: int = 77,
-                 vocab_size: int = 49408,
-                 transformer_width: int = 512,
-                 transformer_heads: int = 8,
-                 transformer_layers: int = 12
-                 ):
+    def __init__(self, embed_dim=512, context_length=77, vocab_size=49408, transformer_width=512, transformer_heads=8, transformer_layers=12):
         super().__init__()
-
         self.context_length = context_length
-
-        self.transformer = Transformer(
-            width=transformer_width,
-            layers=transformer_layers,
-            heads=transformer_heads,
-            attn_mask=self.build_attention_mask()
-        )
-
+        self.transformer = Transformer(width=transformer_width, layers=transformer_layers, heads=transformer_heads, attn_mask=self.build_attention_mask())
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
         self.ln_final = LayerNorm(transformer_width)
-
         self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
-        
         self.initialize_parameters()
 
     def initialize_parameters(self):
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         nn.init.normal_(self.positional_embedding, std=0.01)
-
-        proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
-        attn_std = self.transformer.width ** -0.5
-        fc_std = (2 * self.transformer.width) ** -0.5
-        for block in self.transformer.resblocks:
-            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
-            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
-            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
-            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
-
         if self.text_projection is not None:
             nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
     def build_attention_mask(self):
-        # causal attention mask
         mask = torch.empty(self.context_length, self.context_length)
         mask.fill_(float("-inf"))
-        mask.triu_(1)  # zero out the lower diagonal
+        mask.triu_(1)
         return mask
 
     @property
     def dtype(self):
-        # 默认使用 FP32，如果加载了 FP16 权重会自动转换
         return self.token_embedding.weight.dtype
 
     def forward(self, text):
-        """
-        Args:
-            text: [batch_size, n_ctx] token ids
-        Returns:
-            dict with 'last_hidden_state' [batch_size, n_ctx, embed_dim]
-        """
-        x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
-
+        x = self.token_embedding(text).type(self.dtype)
         x = x + self.positional_embedding.type(self.dtype)
-        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = x.permute(1, 0, 2)
         x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = x.permute(1, 0, 2)
         x = self.ln_final(x).type(self.dtype)
-
-        # 投影到联合空间 (Optional, depending on usage)
-        # x = x @ self.text_projection
-
-        # last_hidden_state 保留了词级信息，用于 FW-MESM
-        # pooler_output 用于句子级信息，用于 SS-MESM
-        eos_x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] # @ self.text_projection
-
+        eos_x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)]
         return dict(last_hidden_state=x, pooler_output=eos_x)
 
-
 # =================================================================
-# 3. GloVe Text Encoder
-#    用于旧数据集 (Charades-STA 等)
+# 3. GloVe Text Encoder (带错误处理的健壮版本)
 # =================================================================
 
 class GloVe(object):
-    def __init__(self, glove_path):
+    def __init__(self, glove_path, dim=300):
         self.glove_path = glove_path
-        self.dim = 300
+        self.dim = dim
         self.glove = self._load()
         # 初始化特殊 token
         if "<PAD>" not in self.glove:
@@ -159,54 +114,60 @@ class GloVe(object):
         return self.glove.get(word, self.glove["<UNK>"])
 
     def _load(self):
+        """ 健壮的 GloVe 加载函数，自动跳过坏行 """
         glove = dict()
-        # 假设 GloVe 文件格式为: word val1 val2 ...
+        logger.info(f"Loading GloVe embeddings from {self.glove_path} ...")
+        
         try:
-            with open(self.glove_path, 'r', encoding='utf-8') as f:
-                for line in tqdm(f, desc=f"Loading GloVe from {self.glove_path}"):
-                    split_line = line.split()
-                    word = " ".join(split_line[:-self.dim])
-                    embedding = torch.tensor([float(val) for val in split_line[-self.dim:]], dtype=torch.float32)
-                    glove[word] = embedding
+            # errors='ignore' 防止编码错误
+            with open(self.glove_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in tqdm(f, desc="Parsing GloVe"):
+                    split_line = line.strip().split()
+                    
+                    # [修复 1] 长度检查：如果切分后长度不足 dim + 1，说明该行截断了，跳过
+                    if len(split_line) < self.dim + 1:
+                        continue
+                        
+                    try:
+                        # [修复 2] 尝试转换向量，如果包含非数字字符则捕获异常
+                        # 取最后 dim 个元素作为向量
+                        vals = [float(val) for val in split_line[-self.dim:]]
+                        embedding = torch.tensor(vals, dtype=torch.float32)
+                        
+                        # 剩下的部分是单词 (处理可能包含空格的短语)
+                        word = " ".join(split_line[:-self.dim])
+                        glove[word] = embedding
+                    except ValueError:
+                        # 再次捕获诸如 'tendineae' 出现在向量区的情况
+                        continue
+                        
         except FileNotFoundError:
-            print(f"Warning: GloVe file not found at {self.glove_path}. Initializing empty dictionary.")
+            logger.error(f"GloVe file not found at {self.glove_path}")
+            # 返回空字典，后续会全部初始化为 UNK
+            return dict()
+            
+        logger.info(f"Successfully loaded {len(glove)} words.")
         return glove
 
 class GloveTextEncoder(nn.Module):
     def __init__(self, vocab_list, glove_path):
-        """
-        Args:
-            vocab_list: list of words in vocabulary
-            glove_path: path to .txt glove file
-        """
         super(GloveTextEncoder, self).__init__()
-        self.glove_loader = GloVe(glove_path)
+        # 假设维度为 300，如果你的文件是其他维度，请修改这里
+        self.glove_loader = GloVe(glove_path, dim=300) 
         dim = self.glove_loader.dim
         
         self.emb = nn.Embedding(num_embeddings=len(vocab_list), embedding_dim=dim)
         
-        # 初始化 Embedding 权重
+        # 填充权重矩阵
         weight_matrix = torch.zeros((len(vocab_list), dim))
         for i, word in enumerate(vocab_list):
             weight_matrix[i] = self.glove_loader.get(word)
             
         self.emb.weight.data.copy_(weight_matrix)
-        
-        # Freeze parameters
+        # 冻结 GloVe 参数
         for param in self.emb.parameters():
             param.requires_grad = False
 
     def forward(self, word_ids):
-        """
-        Args:
-            word_ids: (B, L)
-        Returns:
-            (B, L, out_dim)
-        """
+        # word_ids: [Batch, Len]
         return self.emb(word_ids)
-
-# 辅助函数：加载预训练权重到 CLIPTextEncoder
-def load_clip_weights(model, state_dict):
-    # 需要根据实际 state_dict 的 key 进行匹配
-    # 这里只是一个占位符，实际使用时建议直接用 openai/CLIP 库加载权重后提取参数
-    model.load_state_dict(state_dict, strict=False)

@@ -13,7 +13,6 @@ from bam_layers import (
 class MultiContextPerception(nn.Module):
     def __init__(self, hidden_dim, nhead=8, dropout=0.1):
         super().__init__()
-        # W2W 保持不变
         self.ec_attn = nn.MultiheadAttention(hidden_dim, nhead, dropout=dropout)
         self.ec_norm = nn.LayerNorm(hidden_dim)
         self.cc_conv = nn.Sequential(
@@ -94,11 +93,14 @@ class MESM_W2W_BAM(nn.Module):
         src_vid = self.input_vid_proj(video_feat).permute(1, 0, 2) # [L_v, B, D]
         
         # Positional Embeddings
-        pos_v = self.vid_pos_embed(src_vid.permute(1, 0, 2), video_mask).permute(2, 0, 1)
+        # [核心修复] permute(2, 0, 1) 改为 permute(1, 0, 2)
+        # vid_pos_embed 返回 [Batch, Length, Dim] -> [Length, Batch, Dim]
+        pos_v = self.vid_pos_embed(src_vid.permute(1, 0, 2), video_mask).permute(1, 0, 2)
+        
+        # Text Pos: [Max_L, D] -> [L_t, 1, D] -> [L_t, B, D]
         pos_t = self.txt_pos_embed.weight[:src_txt.shape[0]].unsqueeze(1).repeat(1, src_txt.shape[1], 1)
 
         # 2. MESM Enhance (FW-Level): Video query, Text key
-        # 目的是利用文本增强视频，所以 Query 是 Video
         enhanced_vid = self.enhance_encoder(
             query=src_vid, key=src_txt, 
             key_padding_mask=~words_mask, 
@@ -106,14 +108,13 @@ class MESM_W2W_BAM(nn.Module):
         )
         
         # 3. MESM Align (T2V): Video query, Text key
-        # 对齐后的特征依旧保持 Video 的长度，用于后续 W2W
         f_aligned = self.t2v_encoder(
             query=enhanced_vid, key=src_txt, 
             key_padding_mask=~words_mask, 
             pos_q=pos_v, pos_k=pos_t
         )
 
-        # 4. W2W Context (Requires Video Length)
+        # 4. W2W Context
         f_context = self.w2w_context(f_aligned, key_padding_mask=~video_mask)
 
         # 5. BAM Decoder

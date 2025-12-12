@@ -20,19 +20,25 @@ class VideoDataset(Dataset):
         self.max_v_l = args.max_v_l
         self.max_q_l = args.max_q_l
         
-        # [修改点 1] 支持 .txt 格式标注
+        # 1. 加载标注文件
         anno_path = args.annotation_path
         if not os.path.exists(anno_path):
             raise FileNotFoundError(f"Annotation file not found at {anno_path}")
             
         logger.info(f"Loading annotations from {anno_path}...")
+        
+        # [核心修复] 根据后缀判断加载方式
         if anno_path.endswith('.txt'):
             self.annotations = self._load_txt(anno_path)
         else:
-            with open(anno_path, 'r') as f:
-                self.annotations = json.load(f)
-            
-        # 文本处理准备 (Tokenizer / Vocab)
+            try:
+                with open(anno_path, 'r') as f:
+                    self.annotations = json.load(f)
+            except json.JSONDecodeError:
+                logger.error(f"Failed to load JSON from {anno_path}. Is it a valid JSON file?")
+                raise
+
+        # 2. 文本处理准备 (Tokenizer / Vocab)
         self.text_encoder_type = args.text_encoder_type
         self.vocab = None
         
@@ -42,7 +48,7 @@ class VideoDataset(Dataset):
             logger.info(f"Vocab size: {len(self.vocab)}")
         elif self.text_encoder_type == 'clip':
             if clip is None:
-                logger.warning("CLIP module not found. Please install openai-clip.")
+                logger.warning("Warning: 'clip' module not found. Please install openai-clip.")
 
     def _load_txt(self, path):
         """解析 Charades-STA 原始 txt 格式"""
@@ -61,12 +67,13 @@ class VideoDataset(Dataset):
                     
                     data.append({
                         "video_id": vid_id,
-                        # 注意：TXT 中没有 duration，我们将在 __getitem__ 中根据特征长度计算
+                        # TXT 中没有 duration，稍后在 __getitem__ 中根据特征长度计算
                         "timestamps": [[start, end]],
                         "sentence": sentence.strip()
                     })
                 except Exception as e:
                     logger.warning(f"Skipping line: {line}. Error: {e}")
+        logger.info(f"Loaded {len(data)} samples from txt.")
         return data
 
     def _build_vocab(self):
@@ -79,15 +86,13 @@ class VideoDataset(Dataset):
         
         word2idx = {"<PAD>": 0, "<UNK>": 1}
         for w, count in word_counts.items():
-            if count >= 1:
+            if count >= 1: 
                 word2idx[w] = len(word2idx)
         return word2idx
 
     def _load_video_feature(self, vid_id):
-        """
-        [修改点 2] 读取视频特征
-        优先读取 .npz (用户数据), 兼容 .npy, 保留原有采样逻辑
-        """
+        """读取 .npy / .npz 视频特征"""
+        # 尝试不同后缀
         p_npz = os.path.join(self.feature_dir, f"{vid_id}.npz")
         p_npy = os.path.join(self.feature_dir, f"{vid_id}.npy")
         
@@ -95,16 +100,16 @@ class VideoDataset(Dataset):
         if os.path.exists(p_npz):
             try:
                 data = np.load(p_npz)
-                # 处理 npz 可能的 key: 通常是 'features', 'embedding' 或 'arr_0'
+                # 处理 npz 可能的 key
                 if isinstance(data, np.lib.npyio.NpzFile):
-                    # 尝试常见键名
+                    # 优先查找常见的 key
                     for key in ['features', 'arr_0', 'embedding']:
                         if key in data:
                             feat = data[key]
                             break
-                    if feat is None:
-                        # 如果没找到常见键，取第一个
-                        feat = data[list(data.keys())[0]]
+                    # 如果没找到，尝试取第一个 key
+                    if feat is None and len(data.files) > 0:
+                        feat = data[data.files[0]]
                 else:
                     feat = data
             except Exception as e:
@@ -113,14 +118,14 @@ class VideoDataset(Dataset):
             feat = np.load(p_npy)
             
         if feat is None:
-            # 这里的 raise 替代了您代码中潜在的随机生成逻辑，保证训练数据的真实性
-            # 如果确实需要随机特征调试，可在此处 catch 并生成 torch.randn
             raise FileNotFoundError(f"Feature not found for {vid_id} in {self.feature_dir}")
 
         feat = torch.from_numpy(feat).float()
-        if feat.dim() == 1: feat = feat.unsqueeze(0) # 修正维度
-
-        # --- 保留原有的采样/填充逻辑 ---
+        # 确保维度是 [T, D]
+        if feat.dim() == 1: 
+            feat = feat.unsqueeze(0)
+        
+        # --- 采样/填充逻辑 ---
         seq_len = feat.shape[0]
         target_len = self.max_v_l
         
@@ -135,7 +140,6 @@ class VideoDataset(Dataset):
             mask = torch.cat([torch.ones(seq_len, dtype=torch.bool), 
                               torch.zeros(pad_len, dtype=torch.bool)], dim=0)
             
-        # 返回原始 seq_len 用于计算 duration
         return feat, mask, seq_len
 
     def _process_text(self, sentence):
@@ -171,14 +175,10 @@ class VideoDataset(Dataset):
         # 1. Video
         video_feat, video_mask, raw_seq_len = self._load_video_feature(vid_id)
         
-        # [修改点 3] 计算 Duration 和 归一化时间戳
-        # 用户参数: 24fps, stride=4.  即每帧代表 4/24 = 1/6 秒
+        # 计算 Duration
+        # 24fps, stride=4 => 4/24 = 1/6s per frame
         time_unit = 4.0 / 24.0 
-        
-        # 如果 sample 中没有 duration (txt 读取情况)，则根据特征长度估算
         duration = sample.get('duration', raw_seq_len * time_unit)
-        
-        # 防止 duration 为 0
         if duration <= 0: duration = 1.0
 
         # 2. Text
@@ -198,7 +198,7 @@ class VideoDataset(Dataset):
                 gt_spans.append([center, width])
         
         if len(gt_spans) == 0:
-            gt_spans.append([0.5, 0.1]) # Dummy target if empty
+            gt_spans.append([0.5, 0.1]) 
             
         target = {
             "spans": torch.tensor(gt_spans, dtype=torch.float32),
@@ -213,7 +213,7 @@ class VideoDataset(Dataset):
             "video_mask": video_mask,
             "words_id": words_id,
             "words_mask": words_mask,
-            "targets": target # 注意：Collator 中这里对应 list of dicts
+            "targets": target 
         }
 
 def collate_fn(batch):
