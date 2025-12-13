@@ -4,20 +4,29 @@ from torch import nn
 from utils import span_cxw_to_xx, generalized_temporal_iou
 
 class SetCriterion(nn.Module):
-    def __init__(self, matcher, weight_dict, losses):
+    def __init__(self, matcher, weight_dict, losses, eos_coef=0.1):
         super().__init__()
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.losses = losses
+        self.eos_coef = eos_coef
+        
+        # [新增] 定义类别权重: 前景 1.0, 背景 eos_coef (0.1)
+        # 假设 0: Foreground, 1: Background (对应您代码中的 target_classes=1 初始化)
+        empty_weight = torch.ones(2)
+        empty_weight[1] = self.eos_coef 
+        self.register_buffer('empty_weight', empty_weight)
 
     def loss_labels(self, outputs, targets, indices, num_spans):
         src_logits = outputs['pred_logits']
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:2], 1, dtype=torch.int64, device=src_logits.device) # 1 is background
+        # 1 is background
+        target_classes = torch.full(src_logits.shape[:2], 1, dtype=torch.int64, device=src_logits.device) 
         target_classes[idx] = target_classes_o
         
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes)
+        # [修改 2] 加入 weight 参数
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, weight=self.empty_weight)
         return {'loss_label': loss_ce}
 
     def loss_spans(self, outputs, targets, indices, num_spans):

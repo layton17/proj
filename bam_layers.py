@@ -9,6 +9,10 @@ from utils import _get_activation_fn, _get_clones, MLP, inverse_sigmoid
 # ----------------- Position Encoding -----------------
 
 class PositionEmbeddingSine(nn.Module):
+    """
+    修正后的位置编码，适配 BAM-DETR 逻辑
+    Mask 定义: True(1) 为有效帧, False(0) 为 Padding
+    """
     def __init__(self, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
         super().__init__()
         self.num_pos_feats = num_pos_feats
@@ -22,21 +26,35 @@ class PositionEmbeddingSine(nn.Module):
         self.scale = scale
 
     def forward(self, x, mask=None):
+        """
+        Args:
+            x: [Batch, Length, Dim] (注意：如果您的输入是 [Length, Batch, Dim]，请确保 mask 维度匹配或进行 permute)
+            mask: [Batch, Length], 1 (True) 表示有效，0 (False) 表示 Padding
+        """
         if mask is None:
-            mask = torch.zeros((x.shape[0], x.shape[1]), dtype=torch.bool, device=x.device)
+            # 默认全为有效
+            mask = torch.ones((x.shape[0], x.shape[1]), dtype=torch.bool, device=x.device)
         
-        not_mask = ~mask
-        y_embed = not_mask.cumsum(1, dtype=torch.float32)
+        # [关键修复]：直接对 mask 进行累加，不要取反 (~)
+        # BAM-DETR 原版逻辑: x_embed = mask.cumsum(1, dtype=torch.float32)
+        # 您的 mask 中 True=1, False=0，直接 cumsum 即可得到位置索引 1, 2, 3...
+        y_embed = mask.cumsum(1, dtype=torch.float32)
         
         if self.normalize:
             eps = 1e-6
+            # 归一化到 [0, scale]
             y_embed = y_embed / (y_embed[:, -1:] + eps) * self.scale
 
         dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
-        dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
+        # 修正除法，确保兼容性
+        dim_t = self.temperature ** (2 * torch.div(dim_t, 2, rounding_mode='floor') / self.num_pos_feats)
 
         pos_x = y_embed[:, :, None] / dim_t
         pos_x = torch.stack((pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)
+        
+        # 输出形状 [Batch, Length, Dim]
+        # 注意：如果您的模型其他部分（如 Transformer）期望 [Length, Batch, Dim]，
+        # 请在 forward 外部或这里进行 .permute(1, 0, 2)
         return pos_x
 
 def build_position_encoding(args):
@@ -68,7 +86,7 @@ def gen_sineembed_for_position(pos_tensor, num_pos_feats=256, only_center=False)
 
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False):
+                 activation="relu", normalize_before=True): # 建议默认设为 True
         super().__init__()
         self.ca_qcontent_proj = nn.Linear(d_model, d_model)
         self.ca_qpos_proj = nn.Linear(d_model, d_model)
@@ -76,12 +94,10 @@ class TransformerDecoderLayer(nn.Module):
         self.ca_kpos_proj = nn.Linear(d_model, d_model)
         self.ca_v_proj = nn.Linear(d_model, d_model)
         
-        # 输入维度 d_model * 2 (接收 center+width)，输出映射回 d_model
         self.ca_qpos_sine_proj = nn.Linear(d_model * 2, d_model)
         
         self.cross_attn = nn.MultiheadAttention(d_model * 2, nhead, dropout=dropout, vdim=d_model)
         
-        # [新增] 输出投影层：将 Attention 的 512 维输出映射回 256 维
         self.ca_out_proj = nn.Linear(d_model * 2, d_model)
         
         self.linear1 = nn.Linear(d_model, dim_feedforward)
@@ -94,9 +110,18 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout3 = nn.Dropout(dropout)
         self.activation = _get_activation_fn(activation)
         self.nhead = nhead
+        
+        # [关键修复] 必须添加这行，否则 forward 中无法访问 self.normalize_before
+        self.normalize_before = normalize_before 
 
     def forward(self, tgt, memory, memory_key_padding_mask=None, pos=None, query_pos=None, query_sine_embed=None, **kwargs):
-        q_content = self.ca_qcontent_proj(tgt)
+        # 1. Attention Block (Pre-Norm logic)
+        if self.normalize_before:
+            tgt_norm = self.norm2(tgt)
+        else:
+            tgt_norm = tgt
+
+        q_content = self.ca_qcontent_proj(tgt_norm)
         k_content = self.ca_kcontent_proj(memory)
         v = self.ca_v_proj(memory)
         k_pos = self.ca_kpos_proj(pos)
@@ -120,16 +145,25 @@ class TransformerDecoderLayer(nn.Module):
 
         tgt2 = self.cross_attn(query=q_total, key=k_total, value=v, key_padding_mask=memory_key_padding_mask)[0]
         
-        # [新增] 降维操作：512 -> 256
         tgt2 = self.ca_out_proj(tgt2)
         
         tgt = tgt + self.dropout2(tgt2)
-        tgt = self.norm2(tgt)
         
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        if not self.normalize_before:
+            tgt = self.norm2(tgt)
+
+        # 2. FFN Block (Pre-Norm logic)
+        if self.normalize_before:
+            tgt_norm = self.norm3(tgt)
+        else:
+            tgt_norm = tgt
+            
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt_norm))))
         tgt = tgt + self.dropout3(tgt2)
-        tgt = self.norm3(tgt)
         
+        if not self.normalize_before:
+            tgt = self.norm3(tgt)
+            
         return tgt, None
 
 # ----------------- Boundary Decoder -----------------
