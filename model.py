@@ -86,6 +86,12 @@ class MESM_W2W_BAM(nn.Module):
         self.class_embed = _get_clones(self.class_embed, args.dec_layers)
         self.span_embed = _get_clones(self.span_embed, args.dec_layers)
         self.transformer_decoder.bbox_embed = self.span_embed
+        # [新增] 显著性预测头 (Saliency Head)
+        # 将 Encoder 的输出特征映射为 1 个分数 (前景概率 logits)
+        self.saliency_proj = nn.Linear(args.hidden_dim, 1)
+        
+        # [新增] 显著性头初始化 (偏向输出负值，即背景)
+        nn.init.constant_(self.saliency_proj.bias, -2.0)
 
         # ---------------------------------------------------------------------
         # 初始化分类头 (Prior Bias)
@@ -149,6 +155,8 @@ class MESM_W2W_BAM(nn.Module):
 
         # 4. W2W Context
         f_context = self.w2w_context(f_aligned, key_padding_mask=~video_mask)
+        
+        saliency_scores = self.saliency_proj(f_context).squeeze(-1).permute(1, 0)
 
         # 5. BAM Decoder
         bs = video_feat.shape[0]
@@ -165,7 +173,10 @@ class MESM_W2W_BAM(nn.Module):
 
         out = {
             'pred_logits': outputs_class[-1].permute(1, 0, 2),
-            'pred_spans': outputs_coord[-1].permute(1, 0, 2)
+            'pred_spans': outputs_coord[-1].permute(1, 0, 2),
+            # [新增] 输出显著性分数和 Mask (用于 Loss 计算)
+            'saliency_scores': saliency_scores,
+            'video_mask': video_mask 
         }
         
         if self.args.aux_loss:

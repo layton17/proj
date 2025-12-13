@@ -48,6 +48,23 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch):
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+        # 2. [新增] 计算 MESM 重构损失 (需手动添加)
+        if "recfw_words_logit" in outputs:
+            # 简单的 CrossEntropyLoss
+            # 需要构建标签：这里假设 words_id 就是标签，但需要处理 mask
+            # 注意：MESM 原文通常会对部分词进行 mask，这里为了简化，我们只计算非 pad 部分
+            pred_logits = outputs["recfw_words_logit"] # [B, L_txt, Vocab]
+            gt_ids = words_id # [B, L_txt]
+
+            # 展平计算
+            loss_rec = torch.nn.functional.cross_entropy(
+                pred_logits.transpose(1, 2), 
+                gt_ids, 
+                ignore_index=0 # 假设 0 是 PAD
+            )
+
+            # 将重构损失加入总损失 (权重通常较小，如 0.1 或 0.5)
+            losses += 0.5 * loss_rec
 
         optimizer.zero_grad()
         losses.backward()
@@ -193,7 +210,7 @@ def main(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    criterion = SetCriterion(matcher, weight_dict, losses=['labels', 'spans'])
+    criterion = SetCriterion(matcher, weight_dict, losses=['labels', 'spans', 'saliency'], eos_coef=args.eos_coef)
     criterion.to(device)
 
     # -----------------------------------------------------------
@@ -228,15 +245,13 @@ def main(args):
                 }, best_path)
                 logger.info(f"⭐ New Best Model! R1@0.7: {best_r1_07:.2f}%")
 
-        # 定期保存
-        if (epoch + 1) % 5 == 0:
-            ckpt_path = os.path.join(args.save_dir, f"checkpoint_epoch_{epoch+1}.pth")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'args': args
-            }, ckpt_path)
+        ckpt_path = os.path.join(args.save_dir, "checkpoint_last.pth")
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'args': args
+        }, ckpt_path)
 
 if __name__ == '__main__':
     parser = get_args_parser()
@@ -249,3 +264,4 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     main(args)
+    #os.system("/usr/bin/shutdown")

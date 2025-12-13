@@ -24,6 +24,8 @@ def get_args_parser():
     parser.add_argument('--v_feat_dim', default=1024, type=int) # video dim
     parser.add_argument('--max_v_l', default=75, type=int)     # 最大视频序列长度
     parser.add_argument('--max_q_l', default=32, type=int)     # 最大文本长度
+    #parser.add_argument('--feature_fps', default=24, type=int)
+    #parser.add_argument('--feature_stride', default=4, type=int)
 
     # 训练参数
     parser.add_argument('--lr', default=1e-4, type=float)
@@ -39,5 +41,7 @@ def get_args_parser():
     parser.add_argument('--label_loss_coef', default=1, type=float)
     parser.add_argument('--aux_loss', default=True, type=bool)
     parser.add_argument('--span_loss_type', default="l1", type=str)
+    parser.add_argument('--eos_coef', default=0.1, type=float, help="Relative classification weight of the no-object class")
+    parser.add_argument('--lw_saliency', default=4.0, type=float, help="Weight for saliency loss")
 
     return parser
