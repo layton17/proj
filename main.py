@@ -165,10 +165,36 @@ def main(args):
             transformer_heads=8,
             transformer_layers=12
         )
-        if hasattr(args, 'clip_weight_path') and args.clip_weight_path:
-             logger.info(f"Loading CLIP weights from {args.clip_weight_path}")
-             state_dict = torch.load(args.clip_weight_path, map_location='cpu')
-             text_encoder.load_state_dict(state_dict, strict=False)
+        # ... 在 main.py 中 ...
+
+    if hasattr(args, 'clip_weight_path') and args.clip_weight_path:
+        logger.info(f"Loading CLIP weights from {args.clip_weight_path}")
+        
+        # 1. 解决 JIT 加载问题 (兼容 TorchScript 格式)
+        try:
+            loaded_obj = torch.load(args.clip_weight_path, map_location='cpu')
+        except Exception:
+            loaded_obj = torch.jit.load(args.clip_weight_path, map_location='cpu')
+            
+        if hasattr(loaded_obj, 'state_dict'):
+            state_dict = loaded_obj.state_dict()
+        else:
+            state_dict = loaded_obj
+
+        # -----------------------------------------------------------------
+        # 2. [新增] 解决 Positional Embedding 尺寸不匹配问题
+        # -----------------------------------------------------------------
+        if 'positional_embedding' in state_dict:
+            ckpt_len = state_dict['positional_embedding'].shape[0]  # 通常是 77
+            model_len = text_encoder.positional_embedding.shape[0]  # 这里是 args.max_q_l (32)
+            
+            if ckpt_len > model_len:
+                logger.info(f"⚠️ Truncating positional embedding from {ckpt_len} to {model_len}")
+                # 截取前 model_len 个位置的编码
+                state_dict['positional_embedding'] = state_dict['positional_embedding'][:model_len, :]
+        # -----------------------------------------------------------------
+
+        text_encoder.load_state_dict(state_dict, strict=False)
 
     elif args.text_encoder_type == 'glove':
         logger.info("Building GloVe Text Encoder...")
@@ -182,7 +208,8 @@ def main(args):
     
     if text_encoder is not None:
         text_encoder.to(device)
-    else:
+    elif args.text_encoder_type != 'precomputed': 
+        # 只有在非 precomputed 模式下，text_encoder 为空才是错误
         raise ValueError("Text Encoder failed to initialize.")
 
     # -----------------------------------------------------------
