@@ -2,16 +2,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 import math
-import einops
-from typing import Optional
 from utils import _get_activation_fn, _get_clones, MLP, inverse_sigmoid
 
 # ----------------- Position Encoding -----------------
 
 class PositionEmbeddingSine(nn.Module):
     """
-    修正后的位置编码，适配 BAM-DETR 逻辑
-    Mask 定义: True(1) 为有效帧, False(0) 为 Padding
+    修正后的位置编码，适配 Mask 定义: True=有效, False=Padding
     """
     def __init__(self, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
         super().__init__()
@@ -20,41 +17,26 @@ class PositionEmbeddingSine(nn.Module):
         self.normalize = normalize
         if scale is not None and normalize is False:
             raise ValueError("normalize should be True if scale is passed")
-        
         if scale is None:
             scale = 2 * math.pi
         self.scale = scale
 
     def forward(self, x, mask=None):
-        """
-        Args:
-            x: [Batch, Length, Dim] (注意：如果您的输入是 [Length, Batch, Dim]，请确保 mask 维度匹配或进行 permute)
-            mask: [Batch, Length], 1 (True) 表示有效，0 (False) 表示 Padding
-        """
         if mask is None:
-            # 默认全为有效
             mask = torch.ones((x.shape[0], x.shape[1]), dtype=torch.bool, device=x.device)
         
-        # [关键修复]：直接对 mask 进行累加，不要取反 (~)
-        # BAM-DETR 原版逻辑: x_embed = mask.cumsum(1, dtype=torch.float32)
-        # 您的 mask 中 True=1, False=0，直接 cumsum 即可得到位置索引 1, 2, 3...
+        # [Fix] True=1, 累加得到位置索引
         y_embed = mask.cumsum(1, dtype=torch.float32)
         
         if self.normalize:
             eps = 1e-6
-            # 归一化到 [0, scale]
             y_embed = y_embed / (y_embed[:, -1:] + eps) * self.scale
 
         dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
-        # 修正除法，确保兼容性
         dim_t = self.temperature ** (2 * torch.div(dim_t, 2, rounding_mode='floor') / self.num_pos_feats)
 
         pos_x = y_embed[:, :, None] / dim_t
         pos_x = torch.stack((pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)
-        
-        # 输出形状 [Batch, Length, Dim]
-        # 注意：如果您的模型其他部分（如 Transformer）期望 [Length, Batch, Dim]，
-        # 请在 forward 外部或这里进行 .permute(1, 0, 2)
         return pos_x
 
 def build_position_encoding(args):
@@ -63,7 +45,6 @@ def build_position_encoding(args):
     return position_embedding, None 
 
 def gen_sineembed_for_position(pos_tensor, num_pos_feats=256, only_center=False):
-    # pos_tensor: [N, B, 2] (center, width)
     scale = 2 * math.pi
     dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=pos_tensor.device)
     dim_t = 10000 ** (2 * (dim_t // 2) / num_pos_feats)
@@ -86,18 +67,16 @@ def gen_sineembed_for_position(pos_tensor, num_pos_feats=256, only_center=False)
 
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=True): # 建议默认设为 True
+                 activation="relu", normalize_before=True):
         super().__init__()
         self.ca_qcontent_proj = nn.Linear(d_model, d_model)
-        self.ca_qpos_proj = nn.Linear(d_model, d_model)
         self.ca_kcontent_proj = nn.Linear(d_model, d_model)
-        self.ca_kpos_proj = nn.Linear(d_model, d_model)
         self.ca_v_proj = nn.Linear(d_model, d_model)
-        
+        self.ca_kpos_proj = nn.Linear(d_model, d_model)
+        self.ca_qpos_proj = nn.Linear(d_model, d_model)
         self.ca_qpos_sine_proj = nn.Linear(d_model * 2, d_model)
         
         self.cross_attn = nn.MultiheadAttention(d_model * 2, nhead, dropout=dropout, vdim=d_model)
-        
         self.ca_out_proj = nn.Linear(d_model * 2, d_model)
         
         self.linear1 = nn.Linear(d_model, dim_feedforward)
@@ -110,12 +89,9 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout3 = nn.Dropout(dropout)
         self.activation = _get_activation_fn(activation)
         self.nhead = nhead
-        
-        # [关键修复] 必须添加这行，否则 forward 中无法访问 self.normalize_before
         self.normalize_before = normalize_before 
 
     def forward(self, tgt, memory, memory_key_padding_mask=None, pos=None, query_pos=None, query_sine_embed=None, **kwargs):
-        # 1. Attention Block (Pre-Norm logic)
         if self.normalize_before:
             tgt_norm = self.norm2(tgt)
         else:
@@ -131,7 +107,6 @@ class TransformerDecoderLayer(nn.Module):
         
         q_pos = self.ca_qpos_proj(query_pos) if query_pos is not None else 0
         q = q_content + q_pos
-
         q = q.view(num_queries, bs, self.nhead, n_model // self.nhead)
         
         query_sine_embed = self.ca_qpos_sine_proj(query_sine_embed)
@@ -144,15 +119,12 @@ class TransformerDecoderLayer(nn.Module):
         k_total = torch.cat([k, k_pos], dim=3).view(hw, bs, n_model * 2)
 
         tgt2 = self.cross_attn(query=q_total, key=k_total, value=v, key_padding_mask=memory_key_padding_mask)[0]
-        
         tgt2 = self.ca_out_proj(tgt2)
         
         tgt = tgt + self.dropout2(tgt2)
-        
         if not self.normalize_before:
             tgt = self.norm2(tgt)
 
-        # 2. FFN Block (Pre-Norm logic)
         if self.normalize_before:
             tgt_norm = self.norm3(tgt)
         else:
@@ -166,39 +138,111 @@ class TransformerDecoderLayer(nn.Module):
             
         return tgt, None
 
-# ----------------- Boundary Decoder -----------------
+# ----------------- Boundary Decoder (核心修改部分) -----------------
 
 def bilinear_sampling(value, sampling_locations):
-    N_, T, n_heads, D_ = value.shape
-    _, Lq_, _, _, P_, _ = sampling_locations.shape
-    sampling_grids = 2 * sampling_locations - 1
-    return F.grid_sample(value.permute(0, 2, 3, 1).flatten(0, 1).unsqueeze(2), 
-                         sampling_grids[...,0].flatten(0, 2).unsqueeze(1).unsqueeze(1), 
-                         align_corners=False).flatten(0, 2).permute(1, 0, 2)
+    """
+    value: [L_src, B, N_head, D_head]
+    sampling_locations: [B, N_query, N_head, N_point, 1]
+    """
+    L_src, B, n_head, d_head = value.shape
+    
+    # 1. Prepare Value for grid_sample: [B*H, D_h, 1, L]
+    value_trans = value.permute(1, 2, 3, 0).flatten(0, 1) # [B*H, D_h, L]
+    value_trans = value_trans.unsqueeze(2) # [B*H, D_h, 1, L]
+    
+    # 2. Prepare Grid: [B*H, 1, Nq*Np, 2]
+    _, Nq, _, Np, _ = sampling_locations.shape
+    # [B, Nq, H, P, 1] -> [B, H, Nq, P, 1] -> [B*H, Nq*P]
+    locs = sampling_locations.permute(0, 2, 1, 3, 4).flatten(0, 1).flatten(1, 2).squeeze(-1) 
+    grid = torch.stack([locs, torch.zeros_like(locs)], dim=-1).unsqueeze(1) 
+    
+    # 3. Grid Sample
+    # out: [B*H, D_h, 1, Nq*Np]
+    out = F.grid_sample(value_trans, grid, align_corners=False, padding_mode='zeros')
+    
+    # 4. Reshape back
+    # [B*H, D_h, 1, Nq*Np] -> [B, H, D_h, Nq, Np]
+    out = out.squeeze(2).view(B, n_head, d_head, Nq, Np)
+    
+    # 5. Permute to [B, Nq, H, Np, D_h] (Match attn_weights shape)
+    out = out.permute(0, 3, 1, 4, 2) 
+    
+    return out
 
 class BoundaryDeformation(nn.Module):
-    def __init__(self, d_model, nhead):
+    def __init__(self, d_model, nhead, num_points=4, sampling_ratio=2):
         super().__init__()
         self.d_model = d_model
-        self.num_subpoints = 4
         self.nhead = nhead
-        self.point_offsets = nn.Linear(d_model, self.num_subpoints * nhead)
-        self.value_proj = nn.Linear(d_model*2, d_model)
+        self.num_points = num_points # 每个边界附近的采样点数
+        
+        # 1. 生成采样偏移量 (Learnable Offsets)
+        self.sampling_offsets = nn.Linear(d_model, nhead * num_points * 2) # *2 for start/end
+        self.sampling_offsets.weight.data.zero_()
+        self.sampling_offsets.bias.data.zero_()
+        
+        # 2. 注意力权重 (Attention Weights)
+        self.attention_weights = nn.Linear(d_model, nhead * num_points * 2)
+        self.attention_weights.weight.data.zero_()
+        self.attention_weights.bias.data.zero_()
+        
+        # 3. 投影层
+        self.value_proj = nn.Linear(d_model * 2, d_model) # 处理 concat 的 features
         self.output_proj = nn.Linear(d_model, d_model)
 
     def forward(self, pro_features, features, boundary_points, window_size):
-        features = self.value_proj(features)
-        pooled_feat = features.mean(0, keepdim=True).expand(pro_features.shape[0], -1, -1)
-        return self.output_proj(pooled_feat + pro_features)
+        """
+        pro_features: [Nq, B, D]
+        """
+        Nq, B, D = pro_features.shape
+        L, _, _ = features.shape
+        
+        # 1. 投影 Value
+        value = self.value_proj(features) 
+        value = value.view(L, B, self.nhead, self.d_model // self.nhead)
+        
+        # 2. 计算偏移和权重
+        query = pro_features.permute(1, 0, 2) # [B, Nq, D]
+        offsets = self.sampling_offsets(query).view(B, Nq, self.nhead, self.num_points * 2, 1)
+        attn_weights = self.attention_weights(query).view(B, Nq, self.nhead, self.num_points * 2)
+        attn_weights = F.softmax(attn_weights, dim=-1).unsqueeze(-1) # [B, Nq, H, P, 1]
+        
+        # 3. 计算采样位置 (Sampling Locations)
+        center = boundary_points[..., 0]
+        width = boundary_points[..., 1]
+        start = center - 0.5 * width
+        end = center + 0.5 * width
+        
+        base_locs = torch.stack([start, end], dim=-1).unsqueeze(2).unsqueeze(-1)
+        base_locs = base_locs.repeat(1, 1, self.nhead, self.num_points, 1) # [B, Nq, H, 2P, 1]
+        
+        sampling_locs = base_locs + offsets * width.view(B, Nq, 1, 1, 1) * 0.5
+        sampling_grid = sampling_locs.clamp(0.0, 1.0) * 2.0 - 1.0
+        
+        # 4. 采样
+        # sampled_value: [B, Nq, H, P, D_h] (Fix: Now matches attn_weights)
+        sampled_value = bilinear_sampling(value, sampling_grid) 
+        
+        # 5. 聚合 (Weighted Sum)
+        # [B, Nq, H, P, D_h] * [B, Nq, H, P, 1] -> sum over P -> [B, Nq, H, D_h]
+        out = (sampled_value * attn_weights).sum(-2) 
+        
+        # 6. Flatten & Project
+        out = out.flatten(2) # [B, Nq, D]
+        out = out.permute(1, 0, 2) # [Nq, B, D] (Transformer expects Seq-First)
+        
+        return self.output_proj(out)
 
 class BoundaryDecoderLayer(nn.Module):
     def __init__(self, d_model, dim_feedforward=2048, nhead=8, dropout=0.1, activation="relu"):
         super().__init__()
-        self.d_model = d_model
         self.boundary_deformation = BoundaryDeformation(d_model, nhead)
+        
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.norm1 = nn.LayerNorm(d_model) # Pre-Norm for FFN
+        self.norm2 = nn.LayerNorm(d_model) # Post-Norm for Attn
         self.norm3 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
@@ -206,57 +250,77 @@ class BoundaryDecoderLayer(nn.Module):
         self.activation = _get_activation_fn(activation)
 
     def forward(self, features, proposal_points, pro_features, window_size):
-        tgt2 = self.boundary_deformation(pro_features, features, proposal_points, window_size)
+        # features: [L, B, 2D]
+        # pro_features: [Nq, B, D]
+        
+        # Pre-Norm (Optional, keeping consistent with standard Transfomer)
+        tgt_norm = self.norm2(pro_features)
+        
+        # Deformation Attention
+        tgt2 = self.boundary_deformation(tgt_norm, features, proposal_points, window_size)
         tgt = pro_features + self.dropout2(tgt2)
-        tgt = self.norm2(tgt)
-        tgt2 = self.linear2(self.dropout1(self.activation(self.linear1(tgt))))
+        
+        # FFN
+        tgt_norm = self.norm3(tgt)
+        tgt2 = self.linear2(self.dropout1(self.activation(self.linear1(tgt_norm))))
         tgt = tgt + self.dropout3(tgt2)
-        tgt = self.norm3(tgt)
+        
         return tgt
 
 class TransformerDecoder(nn.Module):
     def __init__(self, decoder_layer, boundary_decoder_layer, num_layers, d_model, nhead, return_intermediate=False):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
-        self.boundary_layers = _get_clones(_get_clones(boundary_decoder_layer, num_layers), 2)
+        # [Fix] 正确初始化边界层
+        self.boundary_layers = _get_clones(boundary_decoder_layer, num_layers)
         self.num_layers = num_layers
         self.return_intermediate = return_intermediate
         self.d_model = d_model
-        self.nhead = nhead
         
         self.ref_point_head = MLP(d_model*2, d_model*2, d_model, 2)
-        self.query_scale = MLP(d_model, d_model, d_model, 2)
-        self.bbox_embed = None
-
+        self.bbox_embed = None # 外部赋值
         self.boundary_conv = nn.Sequential(
             nn.Conv1d(d_model, d_model, 3, padding=1), nn.ReLU(),
             nn.Conv1d(d_model, d_model, 3, padding=1)
         )
 
     def forward(self, tgt, memory, memory_key_padding_mask=None, pos=None, refpoints_unsigmoid=None):
+        # 1. 准备边界增强 Memory
         mem_perm = memory.permute(1, 2, 0)
-        boundary_mem = self.boundary_conv(mem_perm).permute(2, 0, 1)
-        
+        boundary_mem = self.boundary_conv(mem_perm).permute(2, 0, 1) # [L, B, D]
+        mem_boundary_feat = torch.cat([memory, boundary_mem], dim=-1) # [L, B, 2D]
+
         output = tgt
         intermediate = []
         reference_points = refpoints_unsigmoid.sigmoid()
         ref_points_hist = [reference_points]
         
-        mem_boundary_feat = torch.cat([memory, boundary_mem], dim=-1)
-
-        for layer_id, (layer, boundary_layer_pair) in enumerate(zip(self.layers, self.boundary_layers)):
+        for layer_id, (layer, boundary_layer) in enumerate(zip(self.layers, self.boundary_layers)):
+            # 生成 Content Query 的 Position Embedding
             query_sine_embed = gen_sineembed_for_position(
                 reference_points, 
                 num_pos_feats=self.d_model, 
                 only_center=False
             )
-            
             query_pos = self.ref_point_head(query_sine_embed)
             
-            output_prev = output
+            # --- Stream 1: Content Update (Global Context) ---
             output, _ = layer(output, memory, memory_key_padding_mask, pos=pos, query_pos=query_pos, query_sine_embed=query_sine_embed)
             
+            # --- Stream 2: Boundary Update (Local Boundary Refinement) ---
+            ref_points_batch_first = reference_points.permute(1, 0, 2) # [B, Nq, 2]
+            window_size = ref_points_batch_first[..., 1] # [B, Nq]
+
+            output = boundary_layer(
+                features=mem_boundary_feat,      
+                proposal_points=ref_points_batch_first, # 传入 [B, Nq, 2]
+                pro_features=output,             
+                window_size=window_size
+            )
+
+            # --- 坐标更新 (Regress Offsets) ---
             if self.bbox_embed is not None:
+                # 预测相对于当前 reference points 的偏移量
                 tmp = self.bbox_embed[layer_id](output)
                 tmp[..., :2] += inverse_sigmoid(reference_points)
                 reference_points = tmp[..., :2].sigmoid()

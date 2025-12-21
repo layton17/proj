@@ -39,31 +39,35 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch):
     for i, batch in pbar:
         video_feat = batch['video_feat'].to(device)
         video_mask = batch['video_mask'].to(device)
-        words_id = batch['words_id'].to(device)
+        words_id = batch['words_id'].to(device) # 模型输入 (可能是 Feature 也可能是 ID)
+        txt_ids = batch['txt_ids'].to(device)   # Loss 标签 (一定是 ID)
         words_mask = batch['words_mask'].to(device)
+        
+        # 构建 targets 列表
         targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in batch['targets']]
+
+        # [关键修复] 将 txt_ids (整数) 注入到 targets 中供 Loss 使用
+        # 覆盖 targets 原有的 key (如果有的话)，确保 criterion 拿到的是 ID
+        for t, t_id in zip(targets, txt_ids):
+            t['words_id'] = t_id
 
         outputs = model(video_feat, video_mask, words_id, words_mask, is_training=True)
         
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
-        # 2. [新增] 计算 MESM 重构损失 (需手动添加)
-        if "recfw_words_logit" in outputs:
-            # 简单的 CrossEntropyLoss
-            # 需要构建标签：这里假设 words_id 就是标签，但需要处理 mask
-            # 注意：MESM 原文通常会对部分词进行 mask，这里为了简化，我们只计算非 pad 部分
-            pred_logits = outputs["recfw_words_logit"] # [B, L_txt, Vocab]
-            gt_ids = words_id # [B, L_txt]
-
-            # 展平计算
+        
+        # 处理 Fallback Loss (如果 criterion 没算)
+        if 'loss_recfw' in loss_dict and 'loss_recfw' not in weight_dict:
+             losses += 0.5 * loss_dict['loss_recfw']
+        elif "recfw_words_logit" in outputs and 'loss_recfw' not in loss_dict:
+            pred_logits = outputs["recfw_words_logit"]
+            gt_ids = txt_ids # 使用 txt_ids
             loss_rec = torch.nn.functional.cross_entropy(
                 pred_logits.transpose(1, 2), 
                 gt_ids, 
-                ignore_index=0 # 假设 0 是 PAD
+                ignore_index=0 
             )
-
-            # 将重构损失加入总损失 (权重通常较小，如 0.1 或 0.5)
             losses += 0.5 * loss_rec
 
         optimizer.zero_grad()
@@ -86,28 +90,19 @@ def main(args):
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
 
-    # -----------------------------------------------------------
-    # [修改] 日志分离逻辑
-    # -----------------------------------------------------------
-    # 从 save_dir 中提取实验名称 (例如 ./checkpoints/exp1 -> exp1)
+    # 日志分离逻辑
     exp_name = os.path.basename(os.path.normpath(args.save_dir))
-    
-    # 将日志保存到 ./logs/实验名称/ 目录下
-    # 这样 logs 文件夹就和 checkpoints 文件夹平级了
     log_dir = os.path.join("logs", exp_name)
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     
-    # 生成带时间戳的文件名
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(log_dir, f"train_{timestamp}.log")
     
-    # 配置 FileHandler
     file_handler = logging.FileHandler(log_path, mode='w')
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     
-    # 清除旧 Handler 并添加新 Handler
     root_logger = logging.getLogger('')
     for h in root_logger.handlers[:]:
         if isinstance(h, logging.FileHandler):
@@ -165,36 +160,27 @@ def main(args):
             transformer_heads=8,
             transformer_layers=12
         )
-        # ... 在 main.py 中 ...
-
-    if hasattr(args, 'clip_weight_path') and args.clip_weight_path:
-        logger.info(f"Loading CLIP weights from {args.clip_weight_path}")
         
-        # 1. 解决 JIT 加载问题 (兼容 TorchScript 格式)
-        try:
-            loaded_obj = torch.load(args.clip_weight_path, map_location='cpu')
-        except Exception:
-            loaded_obj = torch.jit.load(args.clip_weight_path, map_location='cpu')
-            
-        if hasattr(loaded_obj, 'state_dict'):
-            state_dict = loaded_obj.state_dict()
-        else:
-            state_dict = loaded_obj
+        if hasattr(args, 'clip_weight_path') and args.clip_weight_path:
+            logger.info(f"Loading CLIP weights from {args.clip_weight_path}")
+            try:
+                loaded_obj = torch.load(args.clip_weight_path, map_location='cpu')
+            except Exception:
+                loaded_obj = torch.jit.load(args.clip_weight_path, map_location='cpu')
+                
+            if hasattr(loaded_obj, 'state_dict'):
+                state_dict = loaded_obj.state_dict()
+            else:
+                state_dict = loaded_obj
 
-        # -----------------------------------------------------------------
-        # 2. [新增] 解决 Positional Embedding 尺寸不匹配问题
-        # -----------------------------------------------------------------
-        if 'positional_embedding' in state_dict:
-            ckpt_len = state_dict['positional_embedding'].shape[0]  # 通常是 77
-            model_len = text_encoder.positional_embedding.shape[0]  # 这里是 args.max_q_l (32)
-            
-            if ckpt_len > model_len:
-                logger.info(f"⚠️ Truncating positional embedding from {ckpt_len} to {model_len}")
-                # 截取前 model_len 个位置的编码
-                state_dict['positional_embedding'] = state_dict['positional_embedding'][:model_len, :]
-        # -----------------------------------------------------------------
+            if 'positional_embedding' in state_dict:
+                ckpt_len = state_dict['positional_embedding'].shape[0]
+                model_len = text_encoder.positional_embedding.shape[0]
+                if ckpt_len > model_len:
+                    logger.info(f"⚠️ Truncating positional embedding from {ckpt_len} to {model_len}")
+                    state_dict['positional_embedding'] = state_dict['positional_embedding'][:model_len, :]
 
-        text_encoder.load_state_dict(state_dict, strict=False)
+            text_encoder.load_state_dict(state_dict, strict=False)
 
     elif args.text_encoder_type == 'glove':
         logger.info("Building GloVe Text Encoder...")
@@ -209,7 +195,6 @@ def main(args):
     if text_encoder is not None:
         text_encoder.to(device)
     elif args.text_encoder_type != 'precomputed': 
-        # 只有在非 precomputed 模式下，text_encoder 为空才是错误
         raise ValueError("Text Encoder failed to initialize.")
 
     # -----------------------------------------------------------
@@ -217,7 +202,9 @@ def main(args):
     # -----------------------------------------------------------
     logger.info("Building Model...")
     model = build_model(args)
-    model.text_encoder = text_encoder
+    # 如果 build_model 内部没有赋值 text_encoder，这里手动赋一次
+    if hasattr(model, 'text_encoder') and model.text_encoder is None:
+        model.text_encoder = text_encoder
     model.to(device)
 
     # -----------------------------------------------------------
@@ -231,23 +218,40 @@ def main(args):
                    'loss_span': args.span_loss_coef, 
                    'loss_giou': args.giou_loss_coef}
     
+    # 增加 Quality Loss 和 Recfw Loss 的默认权重（如果 config 里没设置）
+    if 'quality' not in weight_dict:
+        weight_dict['loss_quality'] = 1.0 # 建议权重
+    if 'recfw' not in weight_dict:
+        weight_dict['loss_recfw'] = 0.25   # 建议权重
+
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    criterion = SetCriterion(matcher, weight_dict, losses=['labels', 'spans', 'saliency'], eos_coef=args.eos_coef)
+    # 注册所有需要的 loss
+    losses = ['labels', 'spans', 'quality', 'recfw', 'saliency'] 
+    # 注意：saliency 暂时没用到核心逻辑中，可以根据需要加回
+    
+    criterion = SetCriterion(matcher, weight_dict, losses=losses, eos_coef=args.eos_coef)
     criterion.to(device)
 
     # -----------------------------------------------------------
     # 6. 优化器
     # -----------------------------------------------------------
+    # 将 quality_proj 和 masked_token 等新参数加入优化器
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "text_encoder" not in n and p.requires_grad], "lr": args.lr},
     ]
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
 
+    # 余弦退火调度器
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=args.epochs,     # 自动适配总轮次
+        eta_min=args.lr * 0.01 # 最小学习率 (例如 1e-6)
+    )
     # -----------------------------------------------------------
     # 7. 训练循环
     # -----------------------------------------------------------
@@ -262,8 +266,10 @@ def main(args):
         if dataloader_val is not None:
             metrics = evaluate(model, dataloader_val, device)
             
-            if metrics['R1@0.7'] > best_r1_07:
-                best_r1_07 = metrics['R1@0.7']
+            # 使用更严格的指标 R1@0.7 作为保存标准
+            current_metric = metrics.get('R1@0.7', 0)
+            if current_metric > best_r1_07:
+                best_r1_07 = current_metric
                 best_path = os.path.join(args.save_dir, "checkpoint_best.pth")
                 torch.save({
                     'epoch': epoch,
@@ -290,5 +296,11 @@ if __name__ == '__main__':
         parser.add_argument('--clip_weight_path', default='', type=str, help='Path to pretrained CLIP weights')
     
     args = parser.parse_args()
+    
+    # [关键修复] 在 args 定义后，main 执行前设置默认参数
+    if not hasattr(args, 'vocab_size'):
+        args.vocab_size = 49408
+    if not hasattr(args, 'rec_fw'):
+        args.rec_fw = True
+        
     main(args)
-    #os.system("/usr/bin/shutdown")
